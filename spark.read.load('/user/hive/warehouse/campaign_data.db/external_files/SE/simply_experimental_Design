@@ -1,0 +1,254 @@
+spark.read.load('/user/hive/warehouse/campaign_data.db/external_files/SE/NRMA_billlable_data_May_June_2021.csv', format = 'csv', header = 'true').createOrReplaceTempView('se')
+####################################################
+con = spark.sql('''
+SELECT
+    con.row_id AS con_id,
+    con.csn,
+    UPPER(con.fst_name) AS first_name,
+    UPPER(con.last_name) AS last_name,
+    UPPER(con.email_addr) AS email,
+    UPPER(TRIM(CONCAT_WS(' ', COALESCE(addr.addr, ''), COALESCE(addr.addr_line_2, '')))) AS address,
+    UPPER(TRIM(addr.city)) AS suburb,
+    addr.zipcode AS post_code,
+    addr.state AS region
+FROM
+    gms.s_contact AS con
+    
+LEFT JOIN
+    gms.s_addr_per AS addr
+    ON addr.row_id = con.pr_per_addr_id
+    
+WHERE
+    con.con_cd IN ('Ordinary Member', 'Affiliate Member')
+''') #.cache()
+con.createOrReplaceTempView('con')
+################################################################################################
+wash = spark.sql('''
+SELECT
+    se.*,
+    COALESCE(c1.con_id, c2.con_id, c3.con_id) AS con_id,
+    COALESCE(c1.csn, c2.csn, c3.csn) AS csn,
+    TO_TIMESTAMP(contract_signed_date, 'dd-MMM-yy') AS dt
+FROM
+    se
+LEFT JOIN
+    con AS c1
+    ON se.rewards_card_plan_id = c1.csn
+    
+LEFT JOIN
+    con AS c2
+    ON UPPER(se.email) = c2.email
+    
+LEFT JOIN
+    con AS c3
+    ON UPPER(se.first_name) = c3.first_name
+    AND UPPER(se.last_name) = c3.last_name
+    AND UPPER(se.address) = c3.address
+    AND se.post_code = c3.post_code
+''').cache()
+wash.createOrReplaceTempView('wash')
+##################################################################################################
+spark.sql('''
+        SELECT distinct
+            customer_id, 
+            MAX(B.purpose = 'P') AS promo 
+        FROM 
+            omc.send_level_summary AS A 
+             
+        LEFT JOIN 
+            omc.campaign_info AS B 
+            ON B.campaign_id = A.campaign_id 
+        WHERE 
+            B.channel = 'Push' 
+            AND DATEDIFF(NOW(), A.send_event_date) <= 90 
+             
+        GROUP BY 
+            1 
+''').createOrReplaceTempView('push')
+##############################################################################################
+# Member who had an redemption within last 12 months
+
+spark.sql('''
+select 
+distinct o.row_id as account_id, member_number as member_number
+
+from m4m.return_feed_header m
+
+inner join gms.s_contact con
+on con.csn = m.member_number
+
+inner join gms.s_org_ext o
+on o.row_id = con.pr_dept_ou_id
+
+where 1=1
+and partner like 'Simply Energy'
+and datediff(current_timestamp(),time_stamp) between 0 and 365
+
+''').createOrReplaceTempView('ams')
+
+#spark.sql('select * from ams''').show(10,False)
+###############################################################################################
+eligible = spark.sql("""
+SELECT distinct
+    owner_accnt_id AS account_id,
+    con.row_id AS con_id,
+    con.csn AS member_id,
+    con.fst_name AS first_name,
+    con.last_name AS last_name,
+    con.email_addr AS email_address,
+    case when 
+     ((con.cell_ph_num is not null and nvl(con.veteran_flg,'N') <> 'Y') 
+         and regexp_replace(con.cell_ph_num, "[^0-9]+", "") not like '0_0000000_' 
+         and regexp_replace(con.cell_ph_num, "[^0-9]+", "") not like '041111111_') 
+      then regexp_replace(con.cell_ph_num, "[^0-9]+", "") 
+      else NULL end cell_ph_num,
+      
+      case when 
+     ((con.asst_ph_num is not null and nvl(con.ok_to_sample_flg,'N') <> 'Y') 
+         and regexp_replace(con.asst_ph_num, "[^0-9]+", "") not like '0_0000000_' 
+         and regexp_replace(con.asst_ph_num, "[^0-9]+", "") not like '041111111_') 
+      then regexp_replace(con.asst_ph_num, "[^0-9]+", "") 
+      else NULL end asst_ph_num, 
+      
+      case when 
+      ((con.home_ph_num is not null  and nvl(con.hard_to_reach,'N') <> 'Y') 
+         and regexp_replace(con.home_ph_num, "[^0-9]+", "") not like '0_0000000_' 
+         and regexp_replace(con.home_ph_num, "[^0-9]+", "") not like '041111111_') 
+      then regexp_replace(con.home_ph_num, "[^0-9]+", "") 
+      else NULL end home_ph_num, 
+      
+         case when 
+      ((con.work_ph_num is not null  and nvl(con.speaker_flg,'N') <> 'Y') 
+         and regexp_replace(con.work_ph_num, "[^0-9]+", "") not like '0_0000000_' 
+         and regexp_replace(con.work_ph_num, "[^0-9]+", "") not like '041111111_') 
+      then regexp_replace(con.work_ph_num, "[^0-9]+", "") 
+      else NULL end work_ph_num, 
+    
+    YEAR(NOW()) - YEAR(con.birth_dt) AS age,
+    con.sex_mf AS gender,
+    con.pr_per_addr_id AS addr_id,
+    conx.attrib_55 AS colour_plus,
+    conx.attrib_22 AS geotribe_segment,
+    conx.attrib_17 AS membership_tenure,
+    CASE
+        WHEN 
+        COALESCE(conx.attrib_36, '') != 'No' 
+        AND COALESCE(confnx.brloc_attrib13, '') != 'Y' THEN 'Y'
+        ELSE 'N'
+    END AS edm_consent,
+    case when 
+        COALESCE(con.x_inv_email_1, 'N') = 'N'
+         AND con.email_addr IS NOT NULL then 'Y' 
+        ELSE 'N'
+    END AS email_valid,
+    case when push.customer_id is null then 'N' else 'Y' end AS push_consent
+
+FROM
+    gms.s_contact AS con
+INNER JOIN
+    gms.s_contact_x AS conx
+    ON conx.par_row_id = con.row_id
+INNER JOIN
+    gms.s_contact_fnx AS confnx
+    ON confnx.par_row_id = con.row_id
+INNER JOIN
+    gms.s_asset AS asset
+    ON asset.owner_accnt_id = con.pr_dept_ou_id
+INNER JOIN
+    gms.s_prod_int AS prod
+    ON prod.row_id = asset.prod_id
+LEFT JOIN
+    gms.s_addr_per AS addr
+    ON addr.row_id = con.pr_per_addr_id
+
+LEFT JOIN
+    push
+    on con.row_id = push.customer_id
+
+LEFT ANTI JOIN                                  --excluding members with redemption in the L12
+    ams 
+    ON ams.account_id = con.pr_dept_ou_id
+
+LEFT ANTI JOIN                                  --new simply member list wash
+    wash
+    on wash.csn=con.csn
+
+LEFT anti join                                  --excluding old simply list from Eileens table
+    campaign_data.ek_datawash_20210519 as ex
+    on con.pr_dept_ou_id = ex.account_id
+
+WHERE
+    asset.status_cd = 'Active'
+    AND prod.type = 'Membership'
+    AND prod.prod_cd = 'Promotion'
+    AND con.cust_stat_cd = 'Active'
+    AND con.csn IS NOT NULL
+    AND con.con_cd IN ('Ordinary Member', 'Affiliate Member')
+    AND COALESCE(confnx.deceased_flg,'N') = 'N'
+    AND COALESCE(con.x_nrma_title, '') != 'Estate Of The Late'
+    AND addr.state = 'NSW'
+    AND YEAR(NOW()) - YEAR(con.birth_dt) >= 18
+
+""")
+eligible.createOrReplaceTempView("eligible")
+############################################################################################
+# Members with both consent
+spark.sql('''
+create table campaign_data.simply_test_20211006 as
+with pool as 
+(select *,rand() rnk from eligible where email_valid = 'Y' and edm_consent = 'Y' and push_consent = 'Y')
+select member_id,account_id,con_id,first_name,last_name,email_address,cell_ph_num,age,gender,addr_id,colour_plus,geotribe_segment,membership_tenure,edm_consent,email_valid,push_consent
+        ,
+        (case     when rnk between 0 and 0.1      then 'prof1_control'
+                 when rnk between 0.1 and 0.4    then 'prof1_target_both'
+                 when rnk between 0.4 and 0.7    then 'prof1_target_edm'
+                 else 'prof1_target_push' end) segment
+from pool
+
+''')
+##################################################################################################
+# Members with edm consent only
+spark.sql('''
+create table campaign_data.simply_test2_20211006 as
+with pool as 
+(select *,rand() rnk from eligible where email_valid = 'Y' and edm_consent = 'Y' and push_consent = 'N')
+select member_id,account_id,con_id,first_name,last_name,email_address,cell_ph_num,age,gender,addr_id,colour_plus,geotribe_segment,membership_tenure,edm_consent,email_valid,push_consent
+        ,
+        (case     when rnk between 0 and 0.1      then 'prof2_control'
+                 else 'prof2_target_edm' end) segment
+from pool
+
+''')
+####################################################################################################
+
+# Members with push consent only
+spark.sql('''
+create table campaign_data.simply_test3_20211006 as
+with pool as 
+(select *,rand() rnk from eligible where  (email_valid = 'N' or edm_consent = 'N') and push_consent = 'Y')
+select member_id,account_id,con_id,first_name,last_name,email_address,cell_ph_num,age,gender,addr_id,colour_plus,geotribe_segment,membership_tenure,edm_consent,email_valid,push_consent
+        ,
+        (case     when rnk between 0 and 0.1      then 'prof3_control'
+                 else 'prof3_target_push' end) segment
+from pool
+''')
+###############################################################################################################
+create table campaign_data.aa_dmc2520_se_campaign_edmpush_20211006  as
+select member_id,account_id,con_id,first_name,last_name,email_address,cell_ph_num,age,gender,addr_id,colour_plus,geotribe_segment,membership_tenure,edm_consent,email_valid,push_consent,segment from 
+campaign_data.simply_test_20211006 union
+select member_id,account_id,con_id,first_name,last_name,email_address,cell_ph_num,age,gender,addr_id,colour_plus,geotribe_segment,membership_tenure,edm_consent,email_valid,push_consent,segment from campaign_data.simply_test2_20211006 union 
+select member_id,account_id,con_id,first_name,last_name,email_address,cell_ph_num,age,gender,addr_id,colour_plus,geotribe_segment,membership_tenure,edm_consent,email_valid,push_consent,segment from campaign_data.simply_test3_20211006 
+
+################################################################################################################
+-- GO203_SE_solus_eDM_v1.txt
+select distinct con_id, member_id, segment, case  when segment in ('prof1_target_edm','prof1_target_both','prof2_target_edm') then 'T'  when segment in ('prof1_control','prof2_control') then 'C'           else '' end target_control from campaign_data.aa_dmc2520_se_campaign_edmpush_20211006 where segment in ('prof1_control','prof1_target_edm','prof1_target_both','prof2_target_edm','prof2_control')
+
+################################################################################################################
+-- GO203_SE_push_v1.txt
+select target_control,count(*) from 
+(
+select distinct con_id, member_id, segment, case  when segment in ('prof1_target_push','prof1_target_both','prof3_target_push') then 'T' when segment in ('prof1_control','prof3_control') then 'C'           else '' end target_control from campaign_data.aa_dmc2520_se_campaign_edmpush_20211006 where segment in ('prof1_target_push','prof1_target_both','prof3_target_push','prof1_control','prof3_control')
+) a
+group by 1
+######################################################################################################################
+
