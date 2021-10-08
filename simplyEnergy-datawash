@@ -1,0 +1,98 @@
+##############################################################################################################
+accuracy = spark.sql('''
+
+select rewards_card_planid is not null as match, member_number is not null as match, count(distinct member_number), count(distinct rewards_card_planid)
+from ams 
+full outer join simplyenergy.simplyenergy_nrma_customer_data_09042021 se
+on ams.member_number = se.rewards_card_planid
+group by 1,2
+
+''')
+accuracy.createOrReplaceTempView("accuracy")
+
+spark.sql('''select * from accuracy''').show(100,False)
+###########################################################################################################
+import pyspark.sql.functions as f
+se = spark.sql('''
+SELECT
+  distinct first_name, last_name, email, mobile_number, rewards_card_plan_id
+FROM
+    campaign_data.simplyenergy_NRMA_billables_NSW_180521
+''')#
+split_col = f.split(se['first_name'], ' ')
+se = se.withColumn('first_name1',split_col.getItem(0))
+# se = se.withColumn('first_name2',split_col.getItem(1))
+
+split_col2 = f.split(se['first_name'], '-')
+se = se.withColumn('first_name2',split_col2.getItem(0))
+se.createOrReplaceTempView('exploded')
+############################################################################################################
+from pyspark.sql.functions import concat_ws,col
+se=se.select(concat_ws(' ',se.first_name, se.last_name).alias("FullName"),"first_name", "last_name", "email", "mobile_number", "rewards_card_plan_id","first_name1","first_name2")
+se.createOrReplaceTempView('exploded')
+##############################################################################################################
+exclusion_account = spark.sql('''
+select distinct account_id, 0 as id from eligible e
+inner join exploded se
+on regexp_replace(e.cell_ph_num, "[^0-9]+", "") = regexp_replace(regexp_replace(regexp_replace(regexp_replace(se.mobile_number, "[^0-9]+", ""), "^61", "0") , "^00", "0"), '^([1-9])', '0$1') 
+
+union all
+select distinct account_id, 1 as id from eligible e
+inner join exploded se
+on regexp_replace(e.ASST_PH_NUM, "[^0-9]+", "") = regexp_replace(regexp_replace(regexp_replace(regexp_replace(se.mobile_number, "[^0-9]+", ""), "^61", "0") , "^00", "0"), '^([1-9])', '0$1') 
+
+union all
+select distinct account_id, 2 as id from eligible e
+inner join exploded se
+on regexp_replace(e.HOME_PH_NUM, "[^0-9]+", "") = regexp_replace(regexp_replace(regexp_replace(regexp_replace(se.mobile_number, "[^0-9]+", ""), "^61", "0") , "^00", "0"), '^([1-9])', '0$1') 
+
+union all
+select distinct account_id, 3 as id from eligible e
+inner join exploded se
+on regexp_replace(e.WORK_PH_NUM, "[^0-9]+", "") = regexp_replace(regexp_replace(regexp_replace(regexp_replace(se.mobile_number, "[^0-9]+", ""), "^61", "0") , "^00", "0"), '^([1-9])', '0$1') 
+
+union all
+select distinct account_id, 4 as id from eligible e
+inner join exploded se2
+on lower(trim(e.member_id)) = lower(trim(se2.rewards_card_plan_id))
+
+union all
+select distinct account_id, 5 as id from eligible e
+inner join exploded se5
+on lower(trim(concat(e.first_name,' ',e.last_name))) = lower(trim(se5.FullName))
+
+union all
+select distinct account_id, 6 as id from eligible e
+inner join exploded se6
+on lower(trim(e.email_address)) = lower(trim(se6.email))
+
+union all
+select distinct account_id, 7 as id from eligible e
+inner join exploded se3
+on lower(trim(e.first_name)) = lower(trim(regexp_replace(se3.first_name1, "[^a-zA-Z]", "") ))
+and lower(trim(e.last_name)) = lower(trim(regexp_replace(se3.last_name, "[^a-zA-Z]", "") ))
+
+union all
+select distinct account_id, 8 as id from eligible e
+inner join exploded se4
+on lower(trim(e.first_name)) = lower(trim(regexp_replace(se4.first_name2, "[^a-zA-Z]", "") ))  
+and lower(trim(e.last_name)) = lower(trim(regexp_replace(se4.last_name, "[^a-zA-Z]", "") ))
+
+''')
+
+exclusion_account.createOrReplaceTempView("exclusion_account")
+###################################################################################################################
+spark.sql(''' create table campaign_data.ek_datawash_20210519 as select * from exclusion_account ''')
+# exclusion_contact = spark.sql('''
+# select distinct member_id from eligible e
+# inner join exploded se3
+# on lower(trim(e.first_name)) = lower(trim(regexp_replace(se3.first_name1, "[^a-zA-Z]", "") ))
+# and lower(trim(e.last_name)) = lower(trim(regexp_replace(se3.last_name, "[^a-zA-Z]", "") ))
+
+# union 
+# select distinct member_id from eligible e
+# inner join exploded se4
+# on lower(trim(e.first_name)) = lower(trim(regexp_replace(se4.first_name2, "[^a-zA-Z]", "") ))  
+# and lower(trim(e.last_name)) = lower(trim(regexp_replace(se4.last_name, "[^a-zA-Z]", "") ))
+# ''')
+# exclusion_contact.createOrReplaceTempView("exclusion_contact")
